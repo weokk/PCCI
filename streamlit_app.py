@@ -4,157 +4,183 @@ import pandas as pd
 import openai
 from datetime import datetime, timedelta
 
-# --- 页面配置 ---
-st.set_page_config(page_title="PCCI v6 - 因果智能引擎", layout="wide")
+# --- 1. 页面配置与样式 ---
+st.set_page_config(page_title="PCCI v6.5 - 因果智能引擎", layout="wide")
 
-# --- 侧边栏：配置与输入 ---
-with st.sidebar:
-    st.title("⚙️ PCCI 配置")
-    
-    # 优先从 Secrets 读取，否则留空
-    default_key = st.secrets.get("AI_API_KEY", "")
-    default_url = st.secrets.get("AI_BASE_URL", "https://api.openai.com/v1")
-    default_model = st.secrets.get("AI_MODEL", "gpt-4o")
+st.markdown("""
+    <style>
+    .report-card { background: white; padding: 1.5rem; border-radius: 1rem; border: 1px solid #e2e8f0; margin-bottom: 1rem; }
+    .status-text { font-size: 0.8rem; font-weight: bold; }
+    .stMetric { background: #f8fafc; padding: 10px; border-radius: 10px; border: 1px solid #f1f5f9; }
+    </style>
+""", unsafe_allow_html=True)
 
-    api_key = st.text_input("API Key", type="password", value=default_key)
-    base_url = st.text_input("Base URL", value=default_url)
-    model = st.text_input("Model Name", value=default_model)
-    
-    # --- AI 连通性测试功能 ---
-    if st.button("⚡ 测试 AI 连接"):
-        if not api_key:
-            st.error("请输入 API Key")
-        else:
-            try:
-                client = openai.OpenAI(api_key=api_key, base_url=base_url)
-                # 发送一个极其简单的请求测试连通性
-                test_resp = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": "hi"}],
-                    max_tokens=5
-                )
-                st.success("✅ 联通测试成功！")
-            except Exception as e:
-                st.error(f"❌ 连接失败: {str(e)}")
-    
-    st.divider()
-    mode = st.radio("选择分析模式", ["单标的透视", "事件推演", "组合体检"])
+# --- 2. 初始化 Session State (存储配置与状态) ---
+if "api_ready" not in st.session_state:
+    st.session_state.api_ready = False
 
-# --- 后端逻辑：财务数据抓取 ---
-def get_hard_data(ticker_symbol):
+# --- 3. 核心工具函数 ---
+
+def check_api_connection(key, url, model):
+    """自动检测 API 是否通畅"""
+    if not key:
+        return False
     try:
+        client = openai.OpenAI(api_key=key, base_url=url)
+        # 极简请求，仅用 1 个 token 测试
+        client.chat.completions.create(model=model, messages=[{"role": "user", "content": "1"}], max_tokens=1)
+        return True
+    except:
+        return False
+
+def get_hard_data(ticker_symbol):
+    """抓取 Python 后端硬数据"""
+    try:
+        ticker_symbol = ticker_symbol.upper().strip()
         t = yf.Ticker(ticker_symbol)
         info = t.info
-        # 获取价格 (兼容不同市场的字段)
         price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose', 'N/A')
         
-        region = "Global"
-        market = "SPY"
-        if ".SS" in ticker_symbol or ".SZ" in ticker_symbol: 
-            region, market = "China A-Share", "000001.SS"
-        elif ".HK" in ticker_symbol: 
-            region, market = "Hong Kong", "^HSI"
+        # 自动识别市场
+        cfg = {"name": "Global", "market": "SPY", "rate": "^TNX", "cur": "DX-Y.NYB"}
+        if ticker_symbol.endswith(".SS") or ticker_symbol.endswith(".SZ"):
+            cfg = {"name": "A-Share", "market": "000001.SS", "rate": "^TNX", "cur": "CNY=X"}
+        elif ticker_symbol.endswith(".HK"):
+            cfg = {"name": "Hong Kong", "market": "^HSI", "rate": "^TNX", "cur": "CNY=X"}
 
-        # 获取历史数据计算相关性
+        # 抓取相关性数据
         end = datetime.now()
         start = end - timedelta(days=365)
-        # 抓取标的和对应的大盘、美债、黄金
-        tickers_to_watch = [ticker_symbol, market, "^TNX", "GLD"]
-        data = yf.download(tickers_to_watch, start=start, end=end, progress=False)['Close']
-        
-        # 确保数据对齐
+        data = yf.download([ticker_symbol, cfg['market'], cfg['rate'], cfg['cur']], start=start, end=end, progress=False)['Close']
         df = data.ffill().pct_change().dropna()
-        corrs = {}
-        if ticker_symbol.upper() in df.columns:
-            corrs = df.corr()[ticker_symbol.upper()].to_dict()
+        corrs = df.corr()[ticker_symbol].to_dict() if ticker_symbol in df.columns else {}
 
         return {
             "symbol": ticker_symbol,
-            "fundamentals": {
-                "price": price, 
-                "pe": info.get('trailingPE', 'N/A'), 
-                "peg": info.get('pegRatio', 'N/A'), 
-                "region": region
-            },
+            "fundamentals": {"price": price, "pe": info.get('trailingPE', 'N/A'), "peg": info.get('pegRatio', 'N/A'), "region": cfg['name']},
             "factors": corrs
         }
     except Exception as e:
-        return {"error": f"数据抓取失败: {str(e)}"}
+        return {"error": f"Data Error: {str(e)}"}
 
-# --- 主界面 ---
-st.title("🧠 PCCI v6 因果智能引擎")
+# --- 4. 侧边栏：配置与导航 ---
+
+with st.sidebar:
+    st.title("🧠 PCCI v6.5")
+    
+    # API 状态灯逻辑
+    status_icon = "🟢" if st.session_state.api_ready else "🔴"
+    status_label = "在线" if st.session_state.api_ready else "离线/未配置"
+    
+    st.markdown(f"**API 状态:** {status_icon} <span class='status-text'>{status_label}</span>", unsafe_allow_html=True)
+    
+    # 折叠式设置面板
+    with st.expander("🔧 模型配置 (点击展开)"):
+        # 自动获取默认值 (Secrets -> 用户输入)
+        def_key = st.secrets.get("AI_API_KEY", "")
+        def_url = st.secrets.get("AI_BASE_URL", "https://api.openai.com/v1")
+        def_model = st.secrets.get("AI_MODEL", "gpt-4o")
+
+        api_key = st.text_input("API Key", type="password", value=def_key, help="输入后点击下方测试按钮")
+        base_url = st.text_input("Base URL", value=def_url)
+        model_name = st.text_input("Model Name", value=def_model)
+        
+        if st.button("⚡ 测试并保存"):
+            with st.spinner("正在联通测试..."):
+                is_ok = check_api_connection(api_key, base_url, model_name)
+                st.session_state.api_ready = is_ok
+                if is_ok:
+                    st.success("连接成功！")
+                else:
+                    st.error("连接失败，请检查参数")
+
+    st.divider()
+    mode = st.radio("功能模块", ["单标的透视", "事件推演", "组合体检"])
+    
+    st.caption("v6.5 Final Beta | Powered by yfinance & LLM")
+
+# --- 5. 主页面逻辑 ---
+
+client = openai.OpenAI(api_key=api_key, base_url=base_url) if st.session_state.api_ready else None
 
 if mode == "单标的透视":
-    ticker = st.text_input("输入资产代码 (如 NVDA, 600036.SS, BTC-USD)", value="NVDA").upper().strip()
+    st.subheader("🎯 单标的全维因子透视")
+    ticker = st.text_input("输入资产代码", value="NVDA").upper().strip()
     
-    if st.button("开始双轨分析"):
-        if not api_key:
-            st.warning("⚠️ 请先在侧边栏配置 API Key")
+    if st.button("运行双轨分析"):
+        if not client:
+            st.error("请先在左侧配置并测试 API 联通性")
         else:
-            # 使用 st.status 展示步骤 (更现代的加载方式)
-            with st.status("正在进行全维分析...", expanded=True) as status:
-                st.write("正在从 Yahoo Finance 获取实时硬数据...")
-                hard_data = get_hard_data(ticker)
+            with st.status("正在进行深度分析...", expanded=True) as status:
+                st.write("获取实时硬数据...")
+                hd = get_hard_data(ticker)
                 
-                if "error" in hard_data:
-                    st.error(hard_data["error"])
-                    status.update(label="数据获取失败", state="error")
+                if "error" in hd:
+                    st.error(hd["error"])
                 else:
-                    st.write("硬数据获取成功，正在调用 AI 进行因果推演...")
-                    
-                    # 准备展示硬数据指标
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("价格", hard_data['fundamentals']['price'])
-                    col2.metric("PEG", hard_data['fundamentals']['peg'])
-                    col3.metric("地区", hard_data['fundamentals']['region'])
-                    # 提取利率相关性
-                    rate_corr = hard_data['factors'].get('^TNX', 'N/A')
-                    col4.metric("利率相关性", f"{rate_corr:.2f}" if isinstance(rate_corr, float) else "N/A")
+                    st.write("因果逻辑推演中...")
+                    # 因子数据摘要
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("价格", hd['fundamentals']['price'])
+                    c2.metric("PEG", hd['fundamentals']['peg'])
+                    c3.metric("利率相关性", f"{hd['factors'].get('^TNX', 0):.2f}")
 
-                    # 调用 AI
-                    client = openai.OpenAI(api_key=api_key, base_url=base_url)
-                    prompt = f"""分析标的: {ticker}
-                    硬数据快照: {hard_data}
+                    prompt = f"分析资产: {ticker}\n硬数据: {hd}\n要求：双轨输出（1.传统金融评估 2.PCCI因果推演），中间用 ||| 分隔。中文。"
+                    resp = client.chat.completions.create(model=model_name, messages=[{"role": "user", "content": prompt}])
                     
-                    请输出两部分内容，中间用 ||| 分隔。
+                    res_txt = resp.choices[0].message.content
+                    parts = res_txt.split("|||") if "|||" in res_txt else [res_txt, "逻辑推演生成失败"]
                     
-                    第一部分：【传统金融评估】
-                    基于 PE/PEG 估值、Beta、利率和汇率相关性等硬数据给出客观评价。
-                    
-                    第二部分：【PCCI 因果智能推演】
-                    1. 资产身份定位。
-                    2. 完美世界假设（上涨需要什么情景）。
-                    3. 脆弱性分析 (Kill Switch)。
-                    
-                    中文输出，使用 Markdown。"""
-                    
-                    try:
-                        response = client.chat.completions.create(
-                            model=model,
-                            messages=[{"role": "user", "content": prompt}]
-                        )
-                        full_res = response.choices[0].message.content
-                        
-                        if "|||" in full_res:
-                            parts = full_res.split("|||")
-                        else:
-                            parts = [full_res, "AI 未按格式输出第二部分"]
-                            
-                        status.update(label="分析完成！", state="complete", expanded=False)
-                        
-                        # 展示结果
-                        st.subheader("📊 传统金融评估")
-                        st.info(parts[0])
-                        
-                        st.subheader("🔮 PCCI 因果智能")
-                        st.success(parts[1])
-                        
-                    except Exception as e:
-                        st.error(f"AI 推演阶段出错: {str(e)}")
-                        status.update(label="AI 推演失败", state="error")
+                    st.markdown("### 📊 传统金融评估")
+                    st.info(parts[0])
+                    st.markdown("### 🔮 PCCI 因果智能")
+                    st.success(parts[1])
+                    status.update(label="分析完成", state="complete")
 
 elif mode == "事件推演":
-    st.info("此功能正在集成中，逻辑同单标的透视。")
+    st.subheader("⚡ 现实事件因果推演")
+    event_input = st.text_area("输入新闻事件、财报摘要或政策变动", height=150, placeholder="例如：美联储非农数据超预期，暗示高利率将维持更久...")
+    focus_assets = st.text_input("关注的资产 (可选)", placeholder="例如：黄金, 纳指100, 招商银行")
+    
+    if st.button("执行推演"):
+        if not client:
+            st.error("API 未就绪")
+        else:
+            with st.spinner("构建多世界因果链条..."):
+                prompt = f"""
+                现实事件: {event_input}
+                目标资产: {focus_assets if focus_assets else '自动识别前五大影响资产'}
+                
+                任务：
+                1. 识别该事件激活的“市场叙事”或“世界状态”。
+                2. 分析对 利率、美元、风险偏好、流动性 四大因子的驱动方向。
+                3. 推演对目标资产的 短/中/长期 影响矩阵。
+                
+                请用 Markdown 格式中文回答。
+                """
+                resp = client.chat.completions.create(model=model_name, messages=[{"role": "user", "content": prompt}])
+                st.markdown(resp.choices[0].message.content)
 
 elif mode == "组合体检":
-    st.info("此功能正在集成中。")
+    st.subheader("🩺 投资组合脆弱性诊断")
+    portfolio_text = st.text_area("输入当前持仓清单 (每行一个)", height=150, placeholder="NVDA\n600036.SS\nBTC-USD\nGLD")
+    
+    if st.button("开始诊断"):
+        if not client:
+            st.error("API 未就绪")
+        else:
+            with st.spinner("分析因子暴露与反向开关..."):
+                prompt = f"""
+                资产清单:
+                {portfolio_text}
+                
+                任务：
+                对于列表中的每个资产，分析：
+                1. 它的“因子指纹”：它最怕什么？（例如对利率敏感、对汇率敏感）。
+                2. 隐含的世界观：买入它意味着你此刻在赌一个什么样的未来？
+                3. 致命弱点 (Kill Switch)：发生什么具体宏观情境，该组合会发生系统性回撤？
+                
+                请用 Markdown 格式中文回答。
+                """
+                resp = client.chat.completions.create(model=model_name, messages=[{"role": "user", "content": prompt}])
+                st.markdown(resp.choices[0].message.content)
