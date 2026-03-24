@@ -6,10 +6,9 @@ from datetime import datetime, timedelta
 import re
 
 # --- 1. 页面配置与持久化初始化 ---
-st.set_page_config(page_title="PCCI v7.0 - 因果智能引擎", layout="wide")
+st.set_page_config(page_title="PCCI v7.1 - 容错增强版", layout="wide")
 
-# 初始化所有可能用到的 Session State 变量
-state_keys = [
+state_keys =[
     "api_ready", "profiler_res", "event_res", "diag_res", 
     "manual_api_key", "manual_base_url", "manual_model_name", "hard_data_cache"
 ]
@@ -17,7 +16,6 @@ for key in state_keys:
     if key not in st.session_state:
         st.session_state[key] = None if "res" in key else False
 
-# 全局样式
 st.markdown("""
     <style>
     .stMarkdown code { background-color: transparent !important; color: #e11d48 !important; font-family: monospace; }
@@ -30,12 +28,9 @@ st.markdown("""
 # --- 2. 核心工具函数 ---
 
 def terminal_clean_markdown(text):
-    """彻底剥离 LLM 自动添加的 ```markdown ... ``` 包装"""
     if not text: return ""
     text = text.strip()
-    # 移除开头的 ```xxx
     text = re.sub(r'^```[a-zA-Z]*\n?', '', text, flags=re.IGNORECASE)
-    # 移除结尾的 ```
     text = re.sub(r'\n?```$', '', text)
     return text.strip()
 
@@ -50,35 +45,53 @@ def check_api_connection(key, url, model):
 
 @st.cache_data(ttl=3600)
 def get_hard_data(ticker_symbol):
+    """【重构】防封禁与优雅降级的硬数据获取"""
+    ticker_symbol = ticker_symbol.upper().strip()
+    if ticker_symbol.isdigit() and len(ticker_symbol) == 6:
+        return {"error": f"代码不全。上海: {ticker_symbol}.SS | 深圳: {ticker_symbol}.SZ"}
+
+    cfg = {"name": "Global", "market": "SPY", "rate": "^TNX", "cur": "DX-Y.NYB"}
+    if ticker_symbol.endswith(".SS") or ticker_symbol.endswith(".SZ"):
+        cfg = {"name": "A-Share", "market": "000001.SS", "rate": "^TNX", "cur": "CNY=X"}
+    elif ticker_symbol.endswith(".HK"):
+        cfg = {"name": "Hong Kong", "market": "^HSI", "rate": "^TNX", "cur": "CNY=X"}
+
+    # 1. 优先获取历史行情 (yf.download 不容易被限流)
     try:
-        ticker_symbol = ticker_symbol.upper().strip()
-        if ticker_symbol.isdigit() and len(ticker_symbol) == 6:
-            return {"error": f"代码不全。上海: {ticker_symbol}.SS | 深圳: {ticker_symbol}.SZ"}
-        
-        t = yf.Ticker(ticker_symbol)
-        info = t.info
-        if not info or len(info) < 5 or ('currentPrice' not in info and 'regularMarketPrice' not in info):
-            return {"error": f"标的 '{ticker_symbol}' 未找到。请检查后缀：.SS/.SZ/.HK/.T/-USD"}
-
-        price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose', 'N/A')
-        cfg = {"name": "Global", "market": "SPY", "rate": "^TNX", "cur": "DX-Y.NYB"}
-        if ticker_symbol.endswith(".SS") or ticker_symbol.endswith(".SZ"):
-            cfg = {"name": "A-Share", "market": "000001.SS", "rate": "^TNX", "cur": "CNY=X"}
-        elif ticker_symbol.endswith(".HK"):
-            cfg = {"name": "Hong Kong", "market": "^HSI", "rate": "^TNX", "cur": "CNY=X"}
-
+        end = datetime.now()
+        start = end - timedelta(days=365)
         data = yf.download([ticker_symbol, cfg['market'], cfg['rate'], cfg['cur']], 
-                           start=(datetime.now() - timedelta(days=365)), 
-                           end=datetime.now(), progress=False)['Close']
+                           start=start, end=end, progress=False)['Close']
+        if data.empty or ticker_symbol not in data.columns:
+            return {"error": f"找不到该标的行情: {ticker_symbol}"}
+            
         df = data.ffill().pct_change().dropna()
         corrs = df.corr()[ticker_symbol].to_dict() if ticker_symbol in df.columns else {}
-        return {"symbol": ticker_symbol, "fundamentals": {"price": price, "pe": info.get('trailingPE', 'N/A'), "peg": info.get('pegRatio', 'N/A'), "region": cfg['name']}, "factors": corrs}
+        
+        # 尝试从历史数据提取最新价格作为兜底
+        fallback_price = round(data[ticker_symbol].dropna().iloc[-1], 2)
     except Exception as e:
-        return {"error": f"系统错误: {str(e)}"}
+        return {"error": f"Yahoo API 历史行情限流或报错: {str(e)}"}
+
+    # 2. 尝试获取基本面 (t.info 极易被限流，放入独立 try-except)
+    price, pe, peg = fallback_price, "N/A", "N/A"
+    try:
+        t = yf.Ticker(ticker_symbol)
+        info = t.info
+        price = info.get('currentPrice') or info.get('regularMarketPrice') or fallback_price
+        pe = info.get('trailingPE', 'N/A')
+        peg = info.get('pegRatio', 'N/A')
+    except:
+        pass # 如果 info 被限流，忽略报错，使用 fallback_price 和 N/A
+
+    return {
+        "symbol": ticker_symbol, 
+        "fundamentals": {"price": price, "pe": pe, "peg": peg, "region": cfg['name']}, 
+        "factors": corrs
+    }
 
 # --- 3. 初始化与侧边栏 ---
 
-# 启动时自动测试 Secrets
 if st.session_state.api_ready is False:
     def_key = st.secrets.get("AI_API_KEY", "")
     def_url = st.secrets.get("AI_BASE_URL", "https://api.openai.com/v1")
@@ -93,7 +106,7 @@ def get_current_config():
             mm or st.secrets.get("AI_MODEL", "gpt-4o"))
 
 with st.sidebar:
-    st.title("🧠 PCCI v7.0")
+    st.title("🧠 PCCI v7.1")
     st.markdown(f"**API 状态:** {'🟢 在线' if st.session_state.api_ready else '🔴 离线'}")
     
     with st.expander("🔧 设置"):
@@ -107,7 +120,7 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    mode = st.radio("模块", ["单标的透视", "事件推演", "组合体检"])
+    mode = st.radio("模块",["单标的透视", "事件推演", "组合体检"])
     if st.button("🗑️ 清空当前结果"):
         st.session_state.profiler_res = st.session_state.event_res = st.session_state.diag_res = None
         st.session_state.hard_data_cache = None
@@ -121,20 +134,34 @@ client = openai.OpenAI(api_key=cur_key, base_url=cur_url) if st.session_state.ap
 if mode == "单标的透视":
     st.subheader("🎯 单标的全维因子透视")
     ticker = st.text_input("输入代码", value="NVDA", placeholder="示例: 600036.SS | 0700.HK | BTC-USD").upper().strip()
+    
     if st.button("运行分析"):
         if not client: st.error("请先配置 API")
         else:
             with st.status("分析中...", expanded=True) as status:
+                # 1. 获取硬数据
                 hd = get_hard_data(ticker)
-                if "error" in hd: st.error(hd["error"])
+                
+                # 2. 优雅降级逻辑
+                if "error" in hd:
+                    st.warning(f"⚠️ Yahoo 数据限流: {hd['error']}。系统将自动降级为纯 AI 知识库推演。")
+                    st.session_state.hard_data_cache = None
+                    hd_context = "因接口限流，无法获取实时硬数据。请完全基于你的知识库对该资产进行评估。"
                 else:
                     st.session_state.hard_data_cache = hd
-                    prompt = f"分析资产: {ticker}\n硬数据: {hd}\n要求：双轨输出（1.传统评估 2.PCCI推演），中间用 ||| 分隔。中文。"
+                    hd_context = str(hd)
+
+                # 3. AI 推演
+                prompt = f"分析资产: {ticker}\n硬数据/环境: {hd_context}\n要求：双轨输出（1.传统评估 2.PCCI推演），中间用 ||| 分隔。中文。"
+                try:
                     resp = client.chat.completions.create(model=cur_model, messages=[{"role": "user", "content": prompt}])
                     st.session_state.profiler_res = terminal_clean_markdown(resp.choices[0].message.content)
                     status.update(label="分析完成", state="complete")
+                except Exception as e:
+                    status.update(label="推演失败", state="error")
+                    st.error(f"AI 接口报错: {e}")
     
-    # 渲染结果 (由于在 SessionState 中，所以页面刷新也会保留)
+    # 渲染硬数据看板
     if st.session_state.hard_data_cache:
         hd = st.session_state.hard_data_cache
         c1, c2, c3 = st.columns(3)
@@ -142,6 +169,7 @@ if mode == "单标的透视":
         c2.metric("PEG", hd['fundamentals']['peg'])
         c3.metric("市场", hd['fundamentals']['region'])
     
+    # 渲染双轨报告
     if st.session_state.profiler_res:
         parts = st.session_state.profiler_res.split("|||")
         st.markdown("### 📊 传统金融评估")
